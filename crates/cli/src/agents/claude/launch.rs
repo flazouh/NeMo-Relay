@@ -94,7 +94,14 @@ pub(crate) fn prepare(
         generated_policy_hooks(CodingAgent::ClaudeCode, &hook_commands),
     )?;
     let settings_path = root.join("settings.json");
-    let settings = settings_overlay(&launch.argv, launch.host_index, gateway_url)?;
+    let mut settings = settings_overlay(&launch.argv, launch.host_index, gateway_url)?;
+    apply_prompt_cache_default(
+        &mut settings,
+        &launch.argv,
+        launch.host_index,
+        &std::env::current_dir()?,
+        claude_user_settings_dir().as_deref(),
+    );
     let settings_bytes = serde_json::to_vec_pretty(&settings)
         .map_err(|error| CliError::Launch(error.to_string()))?;
     crate::filesystem::atomic_write_private(&settings_path, &settings_bytes)
@@ -278,6 +285,81 @@ pub(crate) fn settings_overlay(
         Value::String(gateway_url.into()),
     );
     Ok(settings)
+}
+
+const PROMPT_CACHE_TTL: &str = "promptCacheTtl";
+
+/// Claude Code treats a session with an API key as API-key billing and writes 5-minute
+/// prompt-cache entries, where a subscription session gets one hour on the main thread. Relay
+/// restores the hour, except when the caller or a loaded settings scope chose a value: the
+/// `--settings` document outranks every scope, so a value here would replace the user's own.
+pub(crate) fn apply_prompt_cache_default(
+    settings: &mut Value,
+    argv: &[String],
+    host_index: usize,
+    project_dir: &Path,
+    user_dir: Option<&Path>,
+) {
+    let Some(object) = settings.as_object_mut() else {
+        return;
+    };
+    if object.contains_key(PROMPT_CACHE_TTL) {
+        return;
+    }
+    let sources = loaded_setting_sources(argv, host_index);
+    let project = project_dir.join(".claude");
+    let scopes = [
+        ("user", user_dir.map(|dir| dir.join("settings.json"))),
+        ("project", Some(project.join("settings.json"))),
+        ("local", Some(project.join("settings.local.json"))),
+    ];
+    let chosen_elsewhere = scopes.iter().any(|(scope, path)| {
+        sources.contains(scope)
+            && path
+                .as_deref()
+                .is_some_and(settings_file_sets_prompt_cache_ttl)
+    });
+    if !chosen_elsewhere {
+        object.insert(PROMPT_CACHE_TTL.into(), Value::String("1h".into()));
+    }
+}
+
+/// The scopes Claude Code loads: all of them, or the last `--setting-sources` list.
+fn loaded_setting_sources(argv: &[String], host_index: usize) -> Vec<&str> {
+    let arguments = claude_arguments(argv, host_index);
+    let mut selected = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        if arguments[index] == "--setting-sources" {
+            selected = arguments.get(index + 1).map(String::as_str);
+            index += 1;
+        } else if let Some(value) = arguments[index].strip_prefix("--setting-sources=") {
+            selected = Some(value);
+        }
+        index += 1;
+    }
+    selected.map_or_else(
+        || vec!["user", "project", "local"],
+        |value| value.split(',').map(str::trim).collect(),
+    )
+}
+
+fn settings_file_sets_prompt_cache_ttl(path: &Path) -> bool {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .is_some_and(|settings| settings.get(PROMPT_CACHE_TTL).is_some())
+}
+
+fn claude_user_settings_dir() -> Option<PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            crate::agents::shared::host::home_dir()
+                .ok()
+                .map(|home| home.join(".claude"))
+        })
 }
 
 fn first_settings(argv: &[String], host_index: usize) -> Result<Option<&str>, CliError> {
